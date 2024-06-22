@@ -262,23 +262,32 @@ int sockops_prog(struct bpf_sock_ops *skops)
         if (dst != NULL)
             enable_encoding_metadata(skops);
         break;
-    case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
-        if (!is_managed_by_kmesh(skops->family, skops->local_ip4, NULL)) // local ip4 is server ip
-            break;
-        if (bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_STATE_CB_FLAG) != 0)
-            BPF_LOG(ERR, SOCKOPS, "set sockops cb failed!\n");
-        auth_ip_tuple(skops);
-        break;
+    // case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB:
+    //     if (!is_managed_by_kmesh(skops->family, skops->local_ip4, NULL)) // local ip4 is server ip
+    //         break;
+    //     if (bpf_sock_ops_cb_flags_set(skops, BPF_SOCK_OPS_STATE_CB_FLAG) != 0)
+    //         BPF_LOG(ERR, SOCKOPS, "set sockops cb failed!\n");
+    //     auth_ip_tuple(skops);
+    //     break;
     case BPF_SOCK_OPS_STATE_CB:
         if (skops->args[1] == BPF_TCP_CLOSE) {
             clean_auth_map(skops);
             clean_dstinfo_map(skops);
         }
         break;
+    case BPF_SOCK_OPS_TCP_RECVMSG_CB:
+        bpf_printk("enter sockops tcp recvmsg cb\n");
+        if (!bpf_sock_own_by_me(skops)) {
+            bpf_printk("server recvmsg and return -EAGAIN\n");
+            skops->reply = -EAGAIN;
+        } else {
+            skops->reply = 0;
+        }
+        break;
     default:
         break;
     }
-    return 0;
+    return 0; // return 1?
 }
 
 char _license[] SEC("license") = "Dual BSD/GPL";

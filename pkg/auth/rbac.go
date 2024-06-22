@@ -23,11 +23,15 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/cilium/ebpf"
-	"github.com/cilium/ebpf/ringbuf"
+	"github.com/mdlayher/netlink"
 
 	"kmesh.net/kmesh/api/v2/workloadapi"
 	"kmesh.net/kmesh/api/v2/workloadapi/security"
@@ -45,6 +49,8 @@ const (
 	TUPLE_LEN = int(unsafe.Sizeof(bpfSockTupleV6{}))
 	// MSG_LEN is the fixed length of one record we retrieve from map of tuple
 	MSG_LEN = TUPLE_LEN + int(unsafe.Sizeof(MSG_TYPE_IPV4))
+
+	NETLINK_NUM = 30
 )
 
 var (
@@ -98,62 +104,169 @@ func NewRbac(workloadCache cache.WorkloadCache) *Rbac {
 	}
 }
 
-func (r *Rbac) Run(ctx context.Context, mapOfTuple, mapOfAuth *ebpf.Map) {
-	if r == nil || mapOfTuple == nil {
-		log.Error("r or mapOfTuple is nil")
+func (r *Rbac) Run(ctx context.Context, _, _ *ebpf.Map) {
+	if r == nil {
 		return
 	}
-	reader, err := ringbuf.NewReader(mapOfTuple)
-	if err != nil {
-		log.Error("open ringbuf map FAILED, err: ", err)
-		return
-	}
-	defer func() {
-		if err := reader.Close(); err != nil {
-			log.Error("reader Close FAILED, err: ", err)
-		}
-	}()
 
-	rec := ringbuf.Record{}
-	var conn rbacConnection
+	var fd int
+	// Load ko manually for now
+	for {
+		var err error
+		fd, err = sendSockPair()
+		if err != nil {
+			log.Error("sendSockPair error")
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		break
+	}
+
+	// Receive transferred info
+	file := os.NewFile(uintptr(fd), "")
+	defer file.Close()
+	fileConn, err := net.FileConn(file)
+	if err != nil {
+		log.Error("Failed to create file conn, err: ", err)
+		return
+	}
+
+	buf := make([]byte, 32)
+	oob := make([]byte, 32)
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			if err = reader.ReadInto(&rec); err != nil {
-				log.Error("ringbuf reader FAILED to read, err: ", err)
-				continue
-			}
-			if len(rec.RawSample) != MSG_LEN {
-				log.Errorf("wrong length %v of a msg, should be %v", len(rec.RawSample), MSG_LEN)
-				continue
-			}
-			// RawSample is network order
-			msgType := binary.LittleEndian.Uint32(rec.RawSample)
-			tupleData := rec.RawSample[unsafe.Sizeof(msgType):]
-			buf := bytes.NewBuffer(tupleData)
-			switch msgType {
-			case MSG_TYPE_IPV4:
-				conn, err = r.buildConnV4(buf)
-			case MSG_TYPE_IPV6:
-				conn, err = r.buildConnV6(buf)
-			default:
-				log.Error("invalid msg type: ", msgType)
-				continue
-			}
+			_, oobn, _, _, err := fileConn.(*net.UnixConn).ReadMsgUnix(buf, oob)
 			if err != nil {
+				log.Error("Failed to read msg unix, err: ", err)
 				continue
 			}
 
-			if !r.doRbac(&conn) {
-				log.Infof("Auth denied for connection: %+v", conn)
-				// If conn is denied, write tuples into XDP map, which includes source/destination IP/Port
-				if err = r.notifyFunc(mapOfAuth, msgType, tupleData); err != nil {
-					log.Error("authmap update FAILED, err: ", err)
+			// Get socket control message
+			scms, err := syscall.ParseSocketControlMessage(oob[:oobn])
+			if err != nil {
+				log.Error("Failed to parse socket control message, err: ", err)
+				continue
+			}
+
+			if len(scms) > 0 {
+				fds, err := syscall.ParseUnixRights(&(scms[0]))
+				if err != nil {
+					log.Error("Failed to parse unix rights, err: ", err)
+					continue
 				}
+				log.Infof("Get %d info: %v", len(fds), fds)
+
+				localSock, err := syscall.Getsockname(fds[0])
+				if err != nil {
+					log.Error("Failed to get socket name, err: ", err)
+					continue
+				}
+				peerSock, err := syscall.Getpeername(fds[0])
+				if err != nil {
+					log.Error("Failed to get peer name, err: ", err)
+					continue
+				}
+
+				conn, err := r.buildConn(localSock, peerSock)
+				if err != nil {
+					log.Error("Failed to get conn, err: ", err)
+					continue
+				}
+
+				if !r.doRbac(&conn) {
+					log.Info("auth denied, conn: ", conn)
+					if err = syscall.Shutdown(fds[0], 2); err != nil {
+						log.Error("Shutdown, err: ", err)
+					}
+				}
+
+				// switch addr := addr.(type) {
+				// case *syscall.SockaddrInet4:
+				// 	log.Infof("Local address: %v:%v", net.IPv4(addr.Addr[0], addr.Addr[1], addr.Addr[2], addr.Addr[3]), addr.Port)
+				// case *syscall.SockaddrInet6:
+				// 	log.Infof("Local address: [%v]:%v", net.IP(addr.Addr[:]), addr.Port)
+				// default:
+				// 	log.Error("Error: unknown address type")
+				// }
+
+				// sa, err := syscall.Getpeername(int(fds[0]))
+				// if err != nil {
+				// 	log.Error("Failed to get peer name, err: ", err)
+				// 	continue
+				// }
+
+				// switch sa := sa.(type) {
+				// case *syscall.SockaddrInet4:
+				// 	log.Infof("Peer address: %v:%v", net.IP(sa.Addr[:]), sa.Port)
+				// case *syscall.SockaddrInet6:
+				// 	log.Infof("Local address: [%v]:%v", net.IP(sa.Addr[:]), sa.Port)
+				// default:
+				// 	log.Error("Error: unknown address type")
+				// }
+
 			}
 		}
+
+		// if r == nil || mapOfTuple == nil {
+		// 	log.Error("r or mapOfTuple is nil")
+		// 	return
+		// }
+		// reader, err := ringbuf.NewReader(mapOfTuple)
+		// if err != nil {
+		// 	log.Error("open ringbuf map FAILED, err: ", err)
+		// 	return
+		// }
+		// defer func() {
+		// 	if err := reader.Close(); err != nil {
+		// 		log.Error("reader Close FAILED, err: ", err)
+		// 	}
+		// }()
+
+		// rec := ringbuf.Record{}
+		// var conn rbacConnection
+		// for {
+		// 	select {
+		// 	case <-ctx.Done():
+		// 		return
+		// 	default:
+		// 		if err = reader.ReadInto(&rec); err != nil {
+		// 			log.Error("ringbuf reader FAILED to read, err: ", err)
+		// 			continue
+		// 		}
+		// 		if len(rec.RawSample) != MSG_LEN {
+		// 			log.Errorf("wrong length %v of a msg, should be %v", len(rec.RawSample), MSG_LEN)
+		// 			continue
+		// 		}
+		// 		// RawSample is network order
+		// 		msgType := binary.LittleEndian.Uint32(rec.RawSample)
+		// 		tupleData := rec.RawSample[unsafe.Sizeof(msgType):]
+		// 		buf := bytes.NewBuffer(tupleData)
+		// 		switch msgType {
+		// 		case MSG_TYPE_IPV4:
+		// 			conn, err = r.buildConnV4(buf)
+		// 		case MSG_TYPE_IPV6:
+		// 			conn, err = r.buildConnV6(buf)
+		// 		default:
+		// 			log.Error("invalid msg type: ", msgType)
+		// 			continue
+		// 		}
+		// 		if err != nil {
+		// 			continue
+		// 		}
+
+		// 		if !r.doRbac(&conn) {
+		// 			log.Infof("Auth denied for connection: %+v", conn)
+		// 			// If conn is denied, write tuples into XDP map, which includes source/destination IP/Port
+		// 			if err = r.notifyFunc(mapOfAuth, msgType, tupleData); err != nil {
+		// 				log.Error("authmap update FAILED, err: ", err)
+		// 			}
+		// 		}
+		// 	}
+		// }
 	}
 }
 
@@ -502,4 +615,57 @@ func (r *Rbac) getIdentityByIp(ip []byte) Identity {
 		namespace:      workload.GetNamespace(),
 		serviceAccount: workload.GetServiceAccount(),
 	}
+}
+
+func (r *Rbac) buildConn(localSock, peerSock syscall.Sockaddr) (rbacConnection, error) {
+	var conn rbacConnection
+
+	switch sock := localSock.(type) {
+	case *syscall.SockaddrInet4:
+	case *syscall.SockaddrInet6:
+		conn.dstIp = append(conn.dstIp, sock.Addr[len(sock.Addr)-net.IPv4len:]...)
+		conn.dstPort = uint32(sock.Port)
+		log.Infof("Local address: %v:%v", conn.dstIp, conn.dstPort)
+	default:
+		log.Error("Error: unknown sock type")
+	}
+
+	switch peer := peerSock.(type) {
+	case *syscall.SockaddrInet4:
+	case *syscall.SockaddrInet6:
+		conn.srcIp = append(conn.srcIp, peer.Addr[len(peer.Addr)-net.IPv4len:]...)
+		conn.srcIdentity = r.getIdentityByIp(conn.srcIp)
+		log.Infof("Peer address: %v:%v", peer.Addr, peer.Port)
+	default:
+		log.Error("Error: unknown peer type")
+	}
+	log.Info("conn: ", conn)
+	return conn, nil
+}
+
+// Send one of socket pair to kernel via netlink
+func sendSockPair() (int, error) {
+	fds, err := syscall.Socketpair(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+	if err != nil {
+		log.Error("Failed to create socket pair, err: ", err)
+		return 0, err
+	}
+
+	conn, err := netlink.Dial(NETLINK_NUM, nil)
+	if err != nil {
+		log.Error("Failed to dial netlink, err: ", err)
+		return 0, err
+	}
+
+	data := make([]byte, 4)
+	copy(data[:], strconv.Itoa(fds[1]))
+	log.Info("Send socket pair to kernel: ", fds[1])
+
+	nlmsg := netlink.Message{Data: data}
+	_, err = conn.Send(nlmsg)
+	if err != nil {
+		log.Error("Failed to send netlink message, err: ", err)
+		return 0, err
+	}
+	return fds[0], nil
 }
